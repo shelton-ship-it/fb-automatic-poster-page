@@ -1,0 +1,320 @@
+name: StreamVault Reels (Facebook)
+
+# ═══════════════════════════════════════════════════════════════════════
+# Worker de processamento — 1 job = 1 corte = 1 post no Facebook.
+# Toda decisão de "quando" e "quantos cortes" já foi tomada ANTES deste
+# workflow existir (Cloudflare Worker + KV + Cron Trigger, fora do
+# GitHub). Este arquivo só sabe processar o que já chegou pronto:
+# baixar, cortar (stream copy), opcionalmente verticalizar o clipe
+# curto, publicar, apagar. Sem KV, sem cron, sem fila, sem lógica de
+# agenda — de propósito.
+#
+# DIFERENÇAS DE ARQUITETURA EM RELAÇÃO AO process-leve.yml:
+#   - Sem torrent/libtorrent — só HTTP(S) direto. Decisão deliberada:
+#     esperar DHT/peers pode levar minutos, o que contradiz o objetivo
+#     de job ultra-rápido aqui. Se precisar de fonte torrent no futuro,
+#     dá pra portar o bloco "[Modo A] Descarregar vídeo" do
+#     process-leve.yml.
+#   - Sem ffprobe/encode condicional — corte é sempre `-c copy` (stream
+#     copy puro), então o codec de origem não importa pra decisão
+#     nenhuma. Só entra encode de verdade no filtro vertical, e mesmo
+#     assim só sobre o clipe já cortado (60s-5min), nunca sobre a fonte
+#     inteira — por isso continua rápido mesmo com esse passo.
+#   - Sem git-shard/sharding/jsDelivr/ChaCha20 — não guardamos nada.
+#     O Facebook hospeda o vídeo publicado; o clipe local morre no
+#     Cleanup final do job.
+#   - Sem coordinator/dispatch de filhos — 1 job processa 1 corte só.
+#     Multiplicar em N cortes é responsabilidade de quem chama
+#     (Cloudflare), não deste workflow.
+# ═══════════════════════════════════════════════════════════════════════
+
+on:
+  workflow_dispatch:
+    inputs:
+      job_id:
+        description: 'Job ID'
+        required: true
+      video_url:
+        description: 'URL HTTP(S) direta do vídeo fonte'
+        required: true
+      cut_start_seconds:
+        description: 'Ponto de início do corte, em segundos'
+        required: true
+      cut_duration_seconds:
+        description: 'Duração do corte, em segundos'
+        required: false
+        default: '60'
+      destination:
+        description: '"reel" (vertical, video_reels API) ou "video" (post de vídeo normal, sem conversão)'
+        required: false
+        default: 'reel'
+      vertical_mode:
+        description: '"crop" (preenche 9:16 cortando laterais), "pad" (fundo desfocado, mantém frame inteiro) ou "none" (mantém horizontal). Só se aplica quando destination=reel.'
+        required: false
+        default: 'crop'
+      caption:
+        description: 'Legenda final já pronta (comentário + link + tags) — montada pelo chamador, não por este workflow'
+        required: true
+
+jobs:
+  process:
+    runs-on: ubuntu-latest
+    # Job curto por natureza (download de 1 vídeo + corte instantâneo +
+    # no máximo um encode ultrafast de clipe curto + upload pro FB).
+    # 15min é folga generosa; se estourar isso, algo está genuinamente
+    # errado (fonte gigante, upload travado), não vale esperar mais.
+    timeout-minutes: 15
+    permissions:
+      contents: read
+
+    env:
+      WORK_DIR:      /tmp/reels_work/${{ inputs.job_id }}
+      FB_PAGE_ID:    ${{ secrets.FB_PAGE_ID }}
+      FB_PAGE_TOKEN: ${{ secrets.FB_PAGE_TOKEN }}
+
+    steps:
+      - name: Preparar ambiente
+        run: |
+          mkdir -p "$WORK_DIR"
+          echo "JOB_ID=${{ inputs.job_id }}" >> $GITHUB_ENV
+
+      # Cache de pacotes — mesmo padrão do process-leve.yml. libtorrent
+      # volta a entrar aqui: magnet/torrent é obrigatório, não opcional.
+      - name: Instalar ffmpeg + libtorrent (cache)
+        uses: awalsh128/cache-apt-pkgs-action@v1
+        with:
+          packages: ffmpeg python3-libtorrent
+          version: 1.0
+          execute_install_scripts: true
+
+      - name: Atualizar cache do linker (ldconfig)
+        run: sudo ldconfig
+
+      - name: Baixar vídeo (HTTP direto ou torrent)
+        env:
+          VIDEO_URL: ${{ inputs.video_url }}
+        run: |
+          URL="$VIDEO_URL"
+          if [[ "$URL" == magnet:* ]] || [[ "$URL" == *.torrent ]] || [[ "$URL" == *infohash:* ]]; then
+            echo "→ Modo torrent (libtorrent Python)"
+            # LIMITAÇÃO ACEITA: ao contrário do HTTP direto, aqui não dá
+            # pra "baixar só o trecho do corte" — libtorrent não faz seek
+            # arbitrário sem sequenciar peças até lá. Baixa o ficheiro de
+            # vídeo inteiro do torrent, depois corta localmente do mesmo
+            # jeito que o modo HTTP. Mais lento que link direto (depende
+            # de seeders), mas correto — não vale a pena a complexidade
+            # de piece-priority parcial pra um caso que já tem fallback
+            # simples (link direto) quando velocidade importa mais.
+            python3 << 'PYEOF'
+          import libtorrent as lt
+          import os, sys, time, pathlib
+
+          url      = os.environ['VIDEO_URL_ENV']
+          dest_dir = os.environ['WORK_DIR'] + '/torrent_dl'
+          os.makedirs(dest_dir, exist_ok=True)
+          MAX_WAIT = 1800  # 30min — corte é conteúdo curto, não vale esperar mais que isso
+
+          ses = lt.session({
+            'listen_interfaces':       '0.0.0.0:6881',
+            'enable_dht':              True,
+            'enable_lsd':              True,
+            'use_dht_as_fallback':     True,
+            'dht_restrict_routing_ips': False,
+            'dht_bootstrap_nodes':     'router.bittorrent.com:6881,router.utorrent.com:6881,dht.transmissionbt.com:6881,dht.aelitis.com:6881',
+            'alert_mask':              0xffffffff,
+          })
+          try: ses.apply_settings({'connections_limit':200,'active_downloads':1,'active_seeds':0})
+          except Exception as e: print(f"⚠ apply_settings parcial: {e}")
+
+          params = lt.add_torrent_params()
+          params.save_path = dest_dir
+          if url.startswith('magnet:') or 'infohash:' in url:
+            params = lt.parse_magnet_uri(url)
+            params.save_path = dest_dir
+            print(f"  Adicionando magnet: {url[:80]}...")
+          else:
+            import urllib.request
+            torrent_path = '/tmp/reel_input.torrent'
+            urllib.request.urlretrieve(url, torrent_path)
+            info = lt.torrent_info(torrent_path)
+            params.ti = info
+            print(f"  Torrent: {info.name()} ({info.total_size() // (1024*1024)} MB)")
+
+          handle = ses.add_torrent(params)
+          print("  Aguardando metadados + download...")
+          start_t = time.time()
+          last_pct = -1
+          while True:
+            s = handle.status()
+            pct = int(s.progress * 100)
+            if pct != last_pct:
+              print(f"  [{int(time.time()-start_t):4d}s] {pct:3d}% | peers: {s.num_peers}")
+              last_pct = pct
+            if s.is_seeding or s.progress >= 1.0:
+              print(f"✓ Download completo ({int(time.time()-start_t)}s)")
+              break
+            if (time.time() - start_t) > MAX_WAIT:
+              print(f"✗ Timeout de {MAX_WAIT}s sem completar — sem seeders suficientes pra um corte rápido")
+              sys.exit(1)
+            ses.wait_for_alert(1000)
+
+          ses.remove_torrent(handle, 0)
+          video_exts = {'.mp4','.mkv','.avi','.mov','.wmv','.flv','.ts','.m4v','.webm','.mpg','.mpeg'}
+          videos = [f for f in pathlib.Path(dest_dir).rglob('*') if f.suffix.lower() in video_exts]
+          if not videos:
+            print("✗ Nenhum ficheiro de vídeo encontrado no torrent")
+            sys.exit(1)
+          biggest = max(videos, key=lambda f: f.stat().st_size)
+          os.rename(biggest, os.environ['WORK_DIR'] + '/source.video')
+          print(f"✓ Vídeo: {biggest.name} ({biggest.stat().st_size // (1024*1024)} MB)")
+          PYEOF
+            rm -rf "$WORK_DIR/torrent_dl" /tmp/reel_input.torrent
+          else
+            echo "→ Modo HTTP direto"
+            curl -L --retry 3 --retry-delay 5 --progress-bar --fail \
+              -o "$WORK_DIR/source.video" \
+              "$URL"
+          fi
+          SIZE=$(stat -c%s "$WORK_DIR/source.video" 2>/dev/null || echo 0)
+          echo "✓ Vídeo pronto: $(du -sh "$WORK_DIR/source.video" | cut -f1) ($SIZE bytes)"
+          if [ "$SIZE" -lt 10000 ]; then
+            echo "✗ Ficheiro demasiado pequeno — download falhou"
+            exit 1
+          fi
+        env:
+          VIDEO_URL_ENV: ${{ inputs.video_url }}
+
+      - name: Cortar clipe (stream copy — sem reencode)
+        env:
+          CUT_START: ${{ inputs.cut_start_seconds }}
+          CUT_DURATION: ${{ inputs.cut_duration_seconds }}
+        run: |
+          # -ss ANTES do -i = seek no input, praticamente instantâneo
+          # (não decodifica nada até o ponto de corte). Cai no keyframe
+          # mais próximo — não é frame-exato, e não precisa ser: clipe
+          # de segundos/minutos, ninguém nota meio segundo de diferença.
+          # -c copy = puro remux, sem tocar em vídeo nem áudio.
+          ffmpeg -hide_banner -loglevel warning \
+            -ss "$CUT_START" -i "$WORK_DIR/source.video" \
+            -t "$CUT_DURATION" \
+            -c copy -avoid_negative_ts make_zero \
+            -movflags +faststart \
+            -y "$WORK_DIR/clip.mp4"
+
+          if [ ! -s "$WORK_DIR/clip.mp4" ]; then
+            echo "✗ Corte falhou ou gerou ficheiro vazio — cut_start ($CUT_START s) pode estar além da duração do vídeo"
+            exit 1
+          fi
+          echo "✓ Clipe cortado: $(du -sh "$WORK_DIR/clip.mp4" | cut -f1)"
+          rm -f "$WORK_DIR/source.video"
+          echo "  (vídeo fonte removido — não precisamos mais dele)"
+
+      - name: Verticalizar clipe (só se destination=reel e vertical_mode != none)
+        if: inputs.destination == 'reel' && inputs.vertical_mode != 'none'
+        env:
+          VERTICAL_MODE: ${{ inputs.vertical_mode }}
+        run: |
+          # Só entra encode de verdade aqui — e só sobre o clipe já
+          # cortado (60s-5min), nunca sobre a fonte inteira. Ultrafast +
+          # clipe curto = da ordem de segundos, não pesa no job.
+          if [ "$VERTICAL_MODE" = "crop" ]; then
+            echo "→ Vertical: crop-fill (preenche 1080x1920, corta laterais)"
+            FILTER="scale=1080:1920:force_original_aspect_ratio=increase,crop=1080:1920"
+          elif [ "$VERTICAL_MODE" = "pad" ]; then
+            echo "→ Vertical: pad com fundo desfocado (mantém frame inteiro)"
+            FILTER="[0:v]split=2[bg][fg];[bg]scale=1080:1920:force_original_aspect_ratio=increase,crop=1080:1920,gblur=sigma=20[bg];[fg]scale=1080:-2[fg];[bg][fg]overlay=(W-w)/2:(H-h)/2"
+          else
+            echo "✗ vertical_mode desconhecido: $VERTICAL_MODE — mantendo horizontal"
+            exit 0
+          fi
+
+          if ffmpeg -hide_banner -loglevel warning \
+            -i "$WORK_DIR/clip.mp4" \
+            -filter_complex "$FILTER" \
+            -c:v libx264 -preset ultrafast -crf 23 -pix_fmt yuv420p \
+            -c:a copy \
+            -movflags +faststart \
+            -y "$WORK_DIR/clip_vertical.mp4"; then
+            mv "$WORK_DIR/clip_vertical.mp4" "$WORK_DIR/clip.mp4"
+            echo "✓ Verticalizado: $(du -sh "$WORK_DIR/clip.mp4" | cut -f1)"
+          else
+            echo "⚠ Falha ao verticalizar — publicando horizontal mesmo (Facebook faz letterbox sozinho, degrada mas não quebra)"
+          fi
+
+      - name: Publicar Reel no Facebook
+        if: inputs.destination == 'reel'
+        env:
+          CAPTION: ${{ inputs.caption }}
+        run: |
+          set -e
+          # Fluxo de 2 passos da Reels Publishing API (graph.facebook.com):
+          #   1) upload_phase=start        → devolve video_id
+          #   2) upload do binário local    → sem hospedar em lugar nenhum
+          #   3) upload_phase=finish        → publica
+          # NOTA: os headers exatos do passo 2 (upload binário local) vêm
+          # da documentação/Postman collection oficial da Reels API —
+          # antes de ligar o cron em produção, valide esse passo com 1
+          # post manual e confira a resposta de /{video_id}?fields=status.
+
+          echo "→ Passo 1/3: iniciando sessão de upload..."
+          START_RESP=$(curl -s -X POST \
+            "https://graph.facebook.com/v21.0/${FB_PAGE_ID}/video_reels" \
+            -F "access_token=${FB_PAGE_TOKEN}" \
+            -F "upload_phase=start")
+          echo "  resposta: $START_RESP"
+          VIDEO_ID=$(echo "$START_RESP" | python3 -c "import sys,json; print(json.load(sys.stdin)['video_id'])")
+          echo "✓ video_id: $VIDEO_ID"
+
+          echo "→ Passo 2/3: enviando binário do clipe..."
+          FILE_SIZE=$(stat -c%s "$WORK_DIR/clip.mp4")
+          curl -s -X POST \
+            "https://graph-video.facebook.com/v21.0/${VIDEO_ID}" \
+            -H "Authorization: Bearer ${FB_PAGE_TOKEN}" \
+            -H "file_size: ${FILE_SIZE}" \
+            -H "offset: 0" \
+            --data-binary "@${WORK_DIR}/clip.mp4" \
+            -o "$WORK_DIR/upload_resp.json"
+          echo "  resposta: $(cat "$WORK_DIR/upload_resp.json")"
+
+          echo "→ Passo 3/3: publicando..."
+          FINISH_RESP=$(curl -s -X POST \
+            "https://graph.facebook.com/v21.0/${FB_PAGE_ID}/video_reels" \
+            --data-urlencode "access_token=${FB_PAGE_TOKEN}" \
+            --data-urlencode "video_id=${VIDEO_ID}" \
+            --data-urlencode "upload_phase=finish" \
+            --data-urlencode "video_state=PUBLISHED" \
+            --data-urlencode "description=${CAPTION}")
+          echo "  resposta: $FINISH_RESP"
+
+          if echo "$FINISH_RESP" | grep -q '"success":true\|"success": true'; then
+            echo "✓ Reel publicado (video_id=$VIDEO_ID)"
+          else
+            echo "✗ Publicação pode ter falhado — confira a resposta acima"
+            exit 1
+          fi
+
+      - name: Publicar vídeo normal no Facebook
+        if: inputs.destination == 'video'
+        env:
+          CAPTION: ${{ inputs.caption }}
+        run: |
+          set -e
+          echo "→ Publicando vídeo normal (não-reel)..."
+          RESP=$(curl -s -X POST \
+            "https://graph-video.facebook.com/v21.0/${FB_PAGE_ID}/videos" \
+            -F "access_token=${FB_PAGE_TOKEN}" \
+            -F "description=${CAPTION}" \
+            -F "source=@${WORK_DIR}/clip.mp4")
+          echo "  resposta: $RESP"
+          if echo "$RESP" | grep -q '"id"'; then
+            echo "✓ Vídeo publicado"
+          else
+            echo "✗ Publicação pode ter falhado — confira a resposta acima"
+            exit 1
+          fi
+
+      - name: Cleanup
+        if: always()
+        run: |
+          rm -rf "$WORK_DIR"
+          echo "✓ Workspace limpo"
