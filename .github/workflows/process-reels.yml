@@ -91,10 +91,8 @@ jobs:
         run: sudo ldconfig
 
       - name: Baixar vídeo (HTTP direto ou torrent)
-        env:
-          VIDEO_URL: ${{ inputs.video_url }}
         run: |
-          URL="$VIDEO_URL"
+          URL="$VIDEO_URL_ENV"
           if [[ "$URL" == magnet:* ]] || [[ "$URL" == *.torrent ]] || [[ "$URL" == *infohash:* ]]; then
             echo "→ Modo torrent (libtorrent Python)"
             # LIMITAÇÃO ACEITA: ao contrário do HTTP direto, aqui não dá
