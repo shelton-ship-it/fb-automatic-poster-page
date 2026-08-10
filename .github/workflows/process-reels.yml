@@ -157,12 +157,33 @@ jobs:
             ses.wait_for_alert(1000)
 
           ses.remove_torrent(handle, 0)
+
+          # FIX (corrida real vista em produção): progress>=1.0/is_seeding
+          # pode ficar True um instante antes do ÚLTIMO ficheiro do
+          # torrent estar de fato sincronizado em disco (mais comum em
+          # torrents multi-arquivo, exatamente o caso do log de erro).
+          # rglob() acha o Path, mas .stat() falha com FileNotFoundError
+          # logo em seguida porque o arquivo ainda está sendo finalizado
+          # no filesystem. Retry curto em vez de crashar de primeira.
           video_exts = {'.mp4','.mkv','.avi','.mov','.wmv','.flv','.ts','.m4v','.webm','.mpg','.mpeg'}
-          videos = [f for f in pathlib.Path(dest_dir).rglob('*') if f.suffix.lower() in video_exts]
-          if not videos:
-            print("✗ Nenhum ficheiro de vídeo encontrado no torrent")
+          biggest = None
+          for attempt in range(5):
+            videos = [f for f in pathlib.Path(dest_dir).rglob('*') if f.is_file() and f.suffix.lower() in video_exts]
+            if not videos:
+              print(f"  ⚠ Nenhum vídeo encontrado ainda (tentativa {attempt+1}/5) — aguardando finalização do disco...")
+              time.sleep(3)
+              continue
+            try:
+              biggest = max(videos, key=lambda f: f.stat().st_size)
+              break
+            except FileNotFoundError:
+              print(f"  ⚠ Arquivo ainda sendo finalizado em disco (tentativa {attempt+1}/5) — retry em 3s...")
+              time.sleep(3)
+
+          if biggest is None:
+            print("✗ Nenhum ficheiro de vídeo encontrado no torrent (após retries)")
             sys.exit(1)
-          biggest = max(videos, key=lambda f: f.stat().st_size)
+
           os.rename(biggest, os.environ['WORK_DIR'] + '/source.video')
           print(f"✓ Vídeo: {biggest.name} ({biggest.stat().st_size // (1024*1024)} MB)")
           PYEOF
