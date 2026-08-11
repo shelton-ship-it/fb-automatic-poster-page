@@ -95,21 +95,31 @@ jobs:
           URL="$VIDEO_URL_ENV"
           if [[ "$URL" == magnet:* ]] || [[ "$URL" == *.torrent ]] || [[ "$URL" == *infohash:* ]]; then
             echo "→ Modo torrent (libtorrent Python)"
+            mkdir -p "$WORK_DIR/torrent_dl"
             # LIMITAÇÃO ACEITA: ao contrário do HTTP direto, aqui não dá
             # pra "baixar só o trecho do corte" — libtorrent não faz seek
             # arbitrário sem sequenciar peças até lá. Baixa o ficheiro de
             # vídeo inteiro do torrent, depois corta localmente do mesmo
-            # jeito que o modo HTTP. Mais lento que link direto (depende
-            # de seeders), mas correto — não vale a pena a complexidade
-            # de piece-priority parcial pra um caso que já tem fallback
-            # simples (link direto) quando velocidade importa mais.
+            # jeito que o modo HTTP.
+            #
+            # Este step SÓ baixa — não identifica nem move o ficheiro de
+            # vídeo. Isso é proposital: chamar Path.stat() logo após o
+            # loop de download, dentro do mesmo processo Python, é uma
+            # corrida real (visto em produção 2x: progress==100%/
+            # is_seeding não garante que o disk-writer assíncrono do
+            # libtorrent já sincronizou os últimos bytes em disco).
+            # O process-leve.yml nunca teve esse erro porque a detecção
+            # do arquivo roda num STEP SEPARADO, via `find` (bash, sem
+            # stat), na prática dando folga de tempo entre "baixou" e
+            # "leu o arquivo". Replicando a mesma estrutura aqui, em vez
+            # de tentar resolver a corrida com espera/retry dentro do
+            # mesmo processo.
             python3 << 'PYEOF'
           import libtorrent as lt
           import os, sys, time
 
           url      = os.environ['VIDEO_URL_ENV']
           dest_dir = os.environ['WORK_DIR'] + '/torrent_dl'
-          os.makedirs(dest_dir, exist_ok=True)
           MAX_WAIT = 1800  # 30min — corte é conteúdo curto, não vale esperar mais que isso
 
           ses = lt.session({
@@ -156,71 +166,45 @@ jobs:
               sys.exit(1)
             ses.wait_for_alert(1000)
 
-          # Pega caminho/tamanho EXATOS dos metadados do torrent — ainda
-          # com o handle vivo, antes de qualquer remove_torrent. Isso é
-          # determinístico (vem do .torrent/magnet, não de listar disco),
-          # ao contrário de descobrir o arquivo depois via rglob().
-          info = handle.get_torrent_info()
-          fs = info.files()
-          video_exts = {'.mp4','.mkv','.avi','.mov','.wmv','.flv','.ts','.m4v','.webm','.mpg','.mpeg'}
-          candidates = []
-          for i in range(fs.num_files()):
-            path = fs.file_path(i)
-            size = fs.file_size(i)
-            if os.path.splitext(path)[1].lower() in video_exts:
-              candidates.append((path, size))
-
-          if not candidates:
-            print("✗ Nenhum ficheiro de vídeo nos metadados do torrent")
-            sys.exit(1)
-
-          biggest_path, biggest_size = max(candidates, key=lambda c: c[1])
-          full_path = os.path.join(dest_dir, biggest_path)
-          print(f"  Vídeo esperado: {biggest_path} ({biggest_size // (1024*1024)} MB)")
-
           ses.remove_torrent(handle, 0)
-
-          # FIX DEFINITIVO (o retry curto de antes não bastava — visto em
-          # produção que 5x3s não foi suficiente mesmo uma vez):
-          # is_seeding/progress medem PEÇAS RECEBIDAS DA REDE, não bytes
-          # já sincronizados em disco pelo writer assíncrono do
-          # libtorrent — pra um .mkv de vários GB essa defasagem pode
-          # passar de 15s facilmente. Em vez de adivinhar quanto esperar,
-          # esperamos ATIVAMENTE até o tamanho real em disco bater com o
-          # tamanho esperado (vindo dos metadados do torrent, não de uma
-          # listagem de diretório que pode capturar o arquivo pela
-          # metade). Só desiste depois de WAIT_TIMEOUT genuinamente
-          # esgotado.
-          WAIT_TIMEOUT = 180
-          waited = 0
-          while waited < WAIT_TIMEOUT:
-            if os.path.exists(full_path) and os.path.getsize(full_path) >= biggest_size:
-              break
-            time.sleep(3)
-            waited += 3
-          else:
-            print(f"✗ Ficheiro não atingiu o tamanho esperado ({biggest_size} bytes) após {WAIT_TIMEOUT}s: {full_path}")
-            sys.exit(1)
-
-          os.rename(full_path, os.environ['WORK_DIR'] + '/source.video')
-          final_size = os.path.getsize(os.environ['WORK_DIR'] + '/source.video')
-          print(f"✓ Vídeo: {os.path.basename(full_path)} ({final_size // (1024*1024)} MB)")
+          print(f"✓ Torrent baixado em {dest_dir} — detecção do arquivo fica pro próximo step")
           PYEOF
-            rm -rf "$WORK_DIR/torrent_dl" /tmp/reel_input.torrent
           else
             echo "→ Modo HTTP direto"
             curl -L --retry 3 --retry-delay 5 --progress-bar --fail \
               -o "$WORK_DIR/source.video" \
               "$URL"
           fi
+        env:
+          VIDEO_URL_ENV: ${{ inputs.video_url }}
+
+      - name: Detectar ficheiro de vídeo baixado
+        run: |
+          # HTTP direto já deixou pronto em source.video no step anterior
+          # — só o caso torrent precisa localizar o arquivo aqui.
+          if [ ! -f "$WORK_DIR/source.video" ]; then
+            echo "→ Localizando vídeo baixado via torrent (find, mesma técnica do process-leve.yml)"
+            VIDEO_EXTS="mp4 mkv avi mov wmv flv ts m4v webm mpg mpeg"
+            FOUND=""
+            for ext in $VIDEO_EXTS; do
+              FOUND=$(find "$WORK_DIR/torrent_dl" -iname "*.${ext}" | head -1)
+              if [ -n "$FOUND" ]; then break; fi
+            done
+            if [ -z "$FOUND" ]; then
+              echo "✗ Nenhum ficheiro de vídeo encontrado no torrent"
+              find "$WORK_DIR/torrent_dl" -type f
+              exit 1
+            fi
+            mv "$FOUND" "$WORK_DIR/source.video"
+            rm -rf "$WORK_DIR/torrent_dl" /tmp/reel_input.torrent
+          fi
+
           SIZE=$(stat -c%s "$WORK_DIR/source.video" 2>/dev/null || echo 0)
           echo "✓ Vídeo pronto: $(du -sh "$WORK_DIR/source.video" | cut -f1) ($SIZE bytes)"
           if [ "$SIZE" -lt 10000 ]; then
             echo "✗ Ficheiro demasiado pequeno — download falhou"
             exit 1
           fi
-        env:
-          VIDEO_URL_ENV: ${{ inputs.video_url }}
 
       - name: Cortar clipe (stream copy — sem reencode)
         env:
