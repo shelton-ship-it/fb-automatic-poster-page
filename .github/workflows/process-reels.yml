@@ -105,7 +105,7 @@ jobs:
             # simples (link direto) quando velocidade importa mais.
             python3 << 'PYEOF'
           import libtorrent as lt
-          import os, sys, time, pathlib
+          import os, sys, time
 
           url      = os.environ['VIDEO_URL_ENV']
           dest_dir = os.environ['WORK_DIR'] + '/torrent_dl'
@@ -156,36 +156,55 @@ jobs:
               sys.exit(1)
             ses.wait_for_alert(1000)
 
-          ses.remove_torrent(handle, 0)
-
-          # FIX (corrida real vista em produção): progress>=1.0/is_seeding
-          # pode ficar True um instante antes do ÚLTIMO ficheiro do
-          # torrent estar de fato sincronizado em disco (mais comum em
-          # torrents multi-arquivo, exatamente o caso do log de erro).
-          # rglob() acha o Path, mas .stat() falha com FileNotFoundError
-          # logo em seguida porque o arquivo ainda está sendo finalizado
-          # no filesystem. Retry curto em vez de crashar de primeira.
+          # Pega caminho/tamanho EXATOS dos metadados do torrent — ainda
+          # com o handle vivo, antes de qualquer remove_torrent. Isso é
+          # determinístico (vem do .torrent/magnet, não de listar disco),
+          # ao contrário de descobrir o arquivo depois via rglob().
+          info = handle.get_torrent_info()
+          fs = info.files()
           video_exts = {'.mp4','.mkv','.avi','.mov','.wmv','.flv','.ts','.m4v','.webm','.mpg','.mpeg'}
-          biggest = None
-          for attempt in range(5):
-            videos = [f for f in pathlib.Path(dest_dir).rglob('*') if f.is_file() and f.suffix.lower() in video_exts]
-            if not videos:
-              print(f"  ⚠ Nenhum vídeo encontrado ainda (tentativa {attempt+1}/5) — aguardando finalização do disco...")
-              time.sleep(3)
-              continue
-            try:
-              biggest = max(videos, key=lambda f: f.stat().st_size)
-              break
-            except FileNotFoundError:
-              print(f"  ⚠ Arquivo ainda sendo finalizado em disco (tentativa {attempt+1}/5) — retry em 3s...")
-              time.sleep(3)
+          candidates = []
+          for i in range(fs.num_files()):
+            path = fs.file_path(i)
+            size = fs.file_size(i)
+            if os.path.splitext(path)[1].lower() in video_exts:
+              candidates.append((path, size))
 
-          if biggest is None:
-            print("✗ Nenhum ficheiro de vídeo encontrado no torrent (após retries)")
+          if not candidates:
+            print("✗ Nenhum ficheiro de vídeo nos metadados do torrent")
             sys.exit(1)
 
-          os.rename(biggest, os.environ['WORK_DIR'] + '/source.video')
-          print(f"✓ Vídeo: {biggest.name} ({biggest.stat().st_size // (1024*1024)} MB)")
+          biggest_path, biggest_size = max(candidates, key=lambda c: c[1])
+          full_path = os.path.join(dest_dir, biggest_path)
+          print(f"  Vídeo esperado: {biggest_path} ({biggest_size // (1024*1024)} MB)")
+
+          ses.remove_torrent(handle, 0)
+
+          # FIX DEFINITIVO (o retry curto de antes não bastava — visto em
+          # produção que 5x3s não foi suficiente mesmo uma vez):
+          # is_seeding/progress medem PEÇAS RECEBIDAS DA REDE, não bytes
+          # já sincronizados em disco pelo writer assíncrono do
+          # libtorrent — pra um .mkv de vários GB essa defasagem pode
+          # passar de 15s facilmente. Em vez de adivinhar quanto esperar,
+          # esperamos ATIVAMENTE até o tamanho real em disco bater com o
+          # tamanho esperado (vindo dos metadados do torrent, não de uma
+          # listagem de diretório que pode capturar o arquivo pela
+          # metade). Só desiste depois de WAIT_TIMEOUT genuinamente
+          # esgotado.
+          WAIT_TIMEOUT = 180
+          waited = 0
+          while waited < WAIT_TIMEOUT:
+            if os.path.exists(full_path) and os.path.getsize(full_path) >= biggest_size:
+              break
+            time.sleep(3)
+            waited += 3
+          else:
+            print(f"✗ Ficheiro não atingiu o tamanho esperado ({biggest_size} bytes) após {WAIT_TIMEOUT}s: {full_path}")
+            sys.exit(1)
+
+          os.rename(full_path, os.environ['WORK_DIR'] + '/source.video')
+          final_size = os.path.getsize(os.environ['WORK_DIR'] + '/source.video')
+          print(f"✓ Vídeo: {os.path.basename(full_path)} ({final_size // (1024*1024)} MB)")
           PYEOF
             rm -rf "$WORK_DIR/torrent_dl" /tmp/reel_input.torrent
           else
