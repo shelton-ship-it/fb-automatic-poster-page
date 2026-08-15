@@ -1,31 +1,53 @@
-name: StreamVault Reels (Facebook)
+name: StreamVault Reels (Cortes → Artefacto)
 
 # ═══════════════════════════════════════════════════════════════════════
-# Worker de processamento — 1 job = 1 corte = 1 post no Facebook.
-# Toda decisão de "quando" e "quantos cortes" já foi tomada ANTES deste
-# workflow existir (Cloudflare Worker + KV + Cron Trigger, fora do
-# GitHub). Este arquivo só sabe processar o que já chegou pronto:
-# baixar, cortar (stream copy), opcionalmente verticalizar o clipe
-# curto, publicar, apagar. Sem KV, sem cron, sem fila, sem lógica de
-# agenda — de propósito.
+# Worker de processamento — 1 job = 1 corte = 1 artefacto de run.
 #
-# DIFERENÇAS DE ARQUITETURA EM RELAÇÃO AO process-leve.yml:
-#   - Sem torrent/libtorrent — só HTTP(S) direto. Decisão deliberada:
-#     esperar DHT/peers pode levar minutos, o que contradiz o objetivo
-#     de job ultra-rápido aqui. Se precisar de fonte torrent no futuro,
-#     dá pra portar o bloco "[Modo A] Descarregar vídeo" do
-#     process-leve.yml.
-#   - Sem ffprobe/encode condicional — corte é sempre `-c copy` (stream
-#     copy puro), então o codec de origem não importa pra decisão
-#     nenhuma. Só entra encode de verdade no filtro vertical, e mesmo
-#     assim só sobre o clipe já cortado (60s-5min), nunca sobre a fonte
-#     inteira — por isso continua rápido mesmo com esse passo.
-#   - Sem git-shard/sharding/jsDelivr/ChaCha20 — não guardamos nada.
-#     O Facebook hospeda o vídeo publicado; o clipe local morre no
-#     Cleanup final do job.
-#   - Sem coordinator/dispatch de filhos — 1 job processa 1 corte só.
-#     Multiplicar em N cortes é responsabilidade de quem chama
-#     (Cloudflare), não deste workflow.
+# MUDANÇA DE ARQUITETURA em relação à versão anterior:
+#   - ABANDONADO: qualquer publicação automática (Facebook Reels API,
+#     Facebook /videos, /photos). Este workflow não publica nada em
+#     lugar nenhum.
+#   - AGORA: baixa a fonte (HTTP ou torrent), corta o trecho pedido,
+#     aplica o efeito fixo (fundo desfocado 9:16 + header no topo,
+#     conforme o comando ffmpeg de referência) e sobe o clipe pronto
+#     como ARTEFACTO do run (actions/upload-artifact). Você baixa
+#     manualmente na aba Actions do GitHub e posta manualmente no
+#     YouTube.
+#   - "Quando" e "quantos cortes" continuam decididos ANTES deste
+#     workflow existir (Cloudflare Worker), só que agora sem fila nem
+#     cron — o worker dispara isto na hora, pra cada corte.
+#
+# DUAS PREMISSAS DO COMANDO FFMPEG QUE HERDEI LITERALMENTE E NÃO MUDEI
+# POR CONTA PRÓPRIA — confira se valem pra sua fonte:
+#   1. `-map 0:1` assume que a faixa de áudio está sempre no stream
+#      índice 1. Se a fonte tiver uma disposição de streams diferente
+#      (ex: legendas embutidas antes do áudio), isso vai mapear o
+#      stream errado ou falhar. Não troquei pra `-map 0:a:0` por conta
+#      própria — troque se seus arquivos variarem nisso.
+#   2. `drawtext` com `textfile=` em vez de `text=` direto — testado
+#      com header contendo `:`, `'`, `—` e `%` (comando real, vídeo
+#      gerado, frame extraído e inspecionado visualmente): `:`, `'` e
+#      `—` renderizam sem problema com textfile=. O `%` sozinho
+#      QUEBRAVA O TEXTO INTEIRO — sem erro fatal, só um warning "Stray
+#      %", mas o header inteiro sumia do vídeo (o parser de expansão
+#      do próprio drawtext trata `%` como início de `%{...}`,
+#      independente de vir de text= ou textfile=). Corrigido abaixo
+#      com `expansion=none` no filtro, que desliga essa sintaxe de
+#      expansão (não precisamos de timecode/frame_num aqui) e faz o
+#      `%` virar caractere literal sem precisar escapar nada no texto.
+#   3. Headers longos ESTOURAM a largura de 1080px nos dois lados —
+#      não tem quebra de linha nem auto-shrink no filtro. Teste com
+#      "Ele disse: 'nunca mais' — 100%" (31 caracteres) já saiu cortado
+#      nas bordas em fontsize=72. Prefira headers curtos (~20-25
+#      caracteres) até ter uma lógica de fontsize dinâmico.
+#
+# FONTE: o comando original usa Segoe UI Emoji do Windows
+# (C:\Windows\Fonts\seguiemj.ttf), que não existe no runner Ubuntu.
+# Troquei para DejaVu Sans Bold (via apt, fonts-dejavu-core). Efeito
+# colateral real: emoji colorido não renderiza em drawtext do ffmpeg
+# de qualquer forma (limitação de glyph colorido no freetype/libass),
+# então headers com emoji vão sair com um placeholder quebrado — use
+# texto puro no header_text.
 # ═══════════════════════════════════════════════════════════════════════
 
 on:
@@ -35,7 +57,7 @@ on:
         description: 'Job ID'
         required: true
       video_url:
-        description: 'URL HTTP(S) direta do vídeo fonte'
+        description: 'URL HTTP(S) direta do vídeo fonte, ou magnet/torrent'
         required: true
       cut_start_seconds:
         description: 'Ponto de início do corte, em segundos'
@@ -44,33 +66,23 @@ on:
         description: 'Duração do corte, em segundos'
         required: false
         default: '60'
-      destination:
-        description: '"reel" (vertical, video_reels API) ou "video" (post de vídeo normal, sem conversão)'
-        required: false
-        default: 'reel'
-      vertical_mode:
-        description: '"crop" (preenche 9:16 cortando laterais), "pad" (fundo desfocado, mantém frame inteiro) ou "none" (mantém horizontal). Só se aplica quando destination=reel.'
-        required: false
-        default: 'crop'
-      caption:
-        description: 'Legenda final já pronta (comentário + link + tags) — montada pelo chamador, não por este workflow'
+      header_text:
+        description: 'Texto sobreposto no topo do vídeo (sem emoji — não renderiza em drawtext)'
         required: true
 
 jobs:
   process:
     runs-on: ubuntu-latest
-    # Job curto por natureza (download de 1 vídeo + corte instantâneo +
-    # no máximo um encode ultrafast de clipe curto + upload pro FB).
-    # 15min é folga generosa; se estourar isso, algo está genuinamente
-    # errado (fonte gigante, upload travado), não vale esperar mais.
-    timeout-minutes: 15
+    # Agora há encode de verdade (libx264 preset fast sobre o frame
+    # inteiro 1080x1920, não só remux), então a folga é maior que na
+    # versão anterior (que era só stream copy). 25min cobre corte de
+    # até alguns minutos com margem de sobra em runner padrão (2 vCPU).
+    timeout-minutes: 25
     permissions:
       contents: read
 
     env:
-      WORK_DIR:      /tmp/reels_work/${{ inputs.job_id }}
-      FB_PAGE_ID:    ${{ secrets.FB_PAGE_ID }}
-      FB_PAGE_TOKEN: ${{ secrets.FB_PAGE_TOKEN }}
+      WORK_DIR: /tmp/reels_work/${{ inputs.job_id }}
 
     steps:
       - name: Preparar ambiente
@@ -78,12 +90,12 @@ jobs:
           mkdir -p "$WORK_DIR"
           echo "JOB_ID=${{ inputs.job_id }}" >> $GITHUB_ENV
 
-      # Cache de pacotes — mesmo padrão do process-leve.yml. libtorrent
-      # volta a entrar aqui: magnet/torrent é obrigatório, não opcional.
-      - name: Instalar ffmpeg + libtorrent (cache)
+      # Cache de pacotes. fonts-dejavu-core entra aqui pro drawtext ter
+      # uma fonte bold disponível no runner (ver nota de fonte acima).
+      - name: Instalar ffmpeg + libtorrent + fonte (cache)
         uses: awalsh128/cache-apt-pkgs-action@v1
         with:
-          packages: ffmpeg python3-libtorrent
+          packages: ffmpeg python3-libtorrent fonts-dejavu-core
           version: 1.0
           execute_install_scripts: true
 
@@ -96,24 +108,18 @@ jobs:
           if [[ "$URL" == magnet:* ]] || [[ "$URL" == *.torrent ]] || [[ "$URL" == *infohash:* ]]; then
             echo "→ Modo torrent (libtorrent Python)"
             mkdir -p "$WORK_DIR/torrent_dl"
-            # LIMITAÇÃO ACEITA: ao contrário do HTTP direto, aqui não dá
-            # pra "baixar só o trecho do corte" — libtorrent não faz seek
-            # arbitrário sem sequenciar peças até lá. Baixa o ficheiro de
-            # vídeo inteiro do torrent, depois corta localmente do mesmo
-            # jeito que o modo HTTP.
+            # Baixa o ficheiro de vídeo inteiro do torrent (sem seek
+            # arbitrário possível via libtorrent), depois corta
+            # localmente igual ao modo HTTP.
             #
-            # Este step SÓ baixa — não identifica nem move o ficheiro de
-            # vídeo. Isso é proposital: chamar Path.stat() logo após o
-            # loop de download, dentro do mesmo processo Python, é uma
-            # corrida real (visto em produção 2x: progress==100%/
-            # is_seeding não garante que o disk-writer assíncrono do
-            # libtorrent já sincronizou os últimos bytes em disco).
-            # O process-leve.yml nunca teve esse erro porque a detecção
-            # do arquivo roda num STEP SEPARADO, via `find` (bash, sem
-            # stat), na prática dando folga de tempo entre "baixou" e
-            # "leu o arquivo". Replicando a mesma estrutura aqui, em vez
-            # de tentar resolver a corrida com espera/retry dentro do
-            # mesmo processo.
+            # Este step SÓ baixa — não identifica nem move o ficheiro.
+            # Proposital: chamar Path.stat() logo após o loop de
+            # download, no mesmo processo Python, é uma corrida real
+            # (progress==100%/is_seeding não garante que o disk-writer
+            # assíncrono do libtorrent já sincronizou os últimos bytes
+            # em disco). A detecção roda num STEP SEPARADO via `find`
+            # (bash), o que dá folga real de tempo entre "baixou" e
+            # "leu o arquivo".
             python3 << 'PYEOF'
           import libtorrent as lt
           import os, sys, time
@@ -180,10 +186,8 @@ jobs:
 
       - name: Detectar ficheiro de vídeo baixado
         run: |
-          # HTTP direto já deixou pronto em source.video no step anterior
-          # — só o caso torrent precisa localizar o arquivo aqui.
           if [ ! -f "$WORK_DIR/source.video" ]; then
-            echo "→ Localizando vídeo baixado via torrent (find, mesma técnica do process-leve.yml)"
+            echo "→ Localizando vídeo baixado via torrent (find, mesma técnica de sempre)"
             VIDEO_EXTS="mp4 mkv avi mov wmv flv ts m4v webm mpg mpeg"
             FOUND=""
             for ext in $VIDEO_EXTS; do
@@ -206,134 +210,55 @@ jobs:
             exit 1
           fi
 
-      - name: Cortar clipe (stream copy — sem reencode)
+      - name: Preparar arquivo do header (evita escapar texto no filtro)
+        env:
+          HEADER_TEXT: ${{ inputs.header_text }}
+        run: |
+          # textfile= lê o conteúdo bruto do arquivo — não precisa
+          # escapar : ' % dentro do texto, só o texto puro precisa
+          # existir aqui. Isso é o que troquei em relação ao comando
+          # original (que usava text='HEADER' direto na string do
+          # filtro, o que quebra com qualquer desses caracteres).
+          printf '%s' "$HEADER_TEXT" > "$WORK_DIR/header.txt"
+          echo "✓ Header gravado: $(cat "$WORK_DIR/header.txt")"
+
+      - name: Cortar + aplicar fundo desfocado + header
         env:
           CUT_START: ${{ inputs.cut_start_seconds }}
           CUT_DURATION: ${{ inputs.cut_duration_seconds }}
         run: |
-          # -ss ANTES do -i = seek no input, praticamente instantâneo
-          # (não decodifica nada até o ponto de corte). Cai no keyframe
-          # mais próximo — não é frame-exato, e não precisa ser: clipe
-          # de segundos/minutos, ninguém nota meio segundo de diferença.
-          # -c copy = puro remux, sem tocar em vídeo nem áudio.
+          FONT="/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf"
+          OUT="$WORK_DIR/output.mp4"
+
+          # Mesmo filtro do comando de referência, só com os
+          # placeholders (INICIO/ARQUIVO/HEADER/SAIDA) preenchidos por
+          # variáveis do job. Fundo: blur 9:16 preenchendo o frame.
+          # Frente: vídeo original inteiro, escalado sem cortar,
+          # centralizado por cima do fundo desfocado. Header fixo no
+          # topo.
           ffmpeg -hide_banner -loglevel warning \
             -ss "$CUT_START" -i "$WORK_DIR/source.video" \
             -t "$CUT_DURATION" \
-            -c copy -avoid_negative_ts make_zero \
-            -movflags +faststart \
-            -y "$WORK_DIR/clip.mp4"
+            -filter_complex "[0:0]split=2[bg][fg];[bg]scale=1080:1920:force_original_aspect_ratio=increase,crop=1080:1920,boxblur=30:10[blur];[fg]scale=1080:1920:force_original_aspect_ratio=decrease[main];[blur][main]overlay=(W-w)/2:(H-h)/2[base];[base]drawtext=textfile='$WORK_DIR/header.txt':expansion=none:fontfile='$FONT':fontsize=72:fontcolor=white:borderw=5:bordercolor=black:x=(w-text_w)/2:y=100[v]" \
+            -map "[v]" -map 0:1 \
+            -c:v libx264 -preset fast -crf 21 \
+            -c:a aac -b:a 192k -ac 2 \
+            -pix_fmt yuv420p -movflags +faststart \
+            -y "$OUT"
 
-          if [ ! -s "$WORK_DIR/clip.mp4" ]; then
-            echo "✗ Corte falhou ou gerou ficheiro vazio — cut_start ($CUT_START s) pode estar além da duração do vídeo"
+          if [ ! -s "$OUT" ]; then
+            echo "✗ Processamento falhou ou gerou ficheiro vazio — cut_start ($CUT_START s) pode estar além da duração do vídeo, ou o stream de áudio não está no índice 1 (ver nota no topo do arquivo)"
             exit 1
           fi
-          echo "✓ Clipe cortado: $(du -sh "$WORK_DIR/clip.mp4" | cut -f1)"
+          echo "✓ Corte processado: $(du -sh "$OUT" | cut -f1)"
           rm -f "$WORK_DIR/source.video"
-          echo "  (vídeo fonte removido — não precisamos mais dele)"
 
-      - name: Verticalizar clipe (só se destination=reel e vertical_mode != none)
-        if: inputs.destination == 'reel' && inputs.vertical_mode != 'none'
-        env:
-          VERTICAL_MODE: ${{ inputs.vertical_mode }}
-        run: |
-          # Só entra encode de verdade aqui — e só sobre o clipe já
-          # cortado (60s-5min), nunca sobre a fonte inteira. Ultrafast +
-          # clipe curto = da ordem de segundos, não pesa no job.
-          if [ "$VERTICAL_MODE" = "crop" ]; then
-            echo "→ Vertical: crop-fill (preenche 1080x1920, corta laterais)"
-            FILTER="scale=1080:1920:force_original_aspect_ratio=increase,crop=1080:1920"
-          elif [ "$VERTICAL_MODE" = "pad" ]; then
-            echo "→ Vertical: pad com fundo desfocado (mantém frame inteiro)"
-            FILTER="[0:v]split=2[bg][fg];[bg]scale=1080:1920:force_original_aspect_ratio=increase,crop=1080:1920,gblur=sigma=20[bg];[fg]scale=1080:-2[fg];[bg][fg]overlay=(W-w)/2:(H-h)/2"
-          else
-            echo "✗ vertical_mode desconhecido: $VERTICAL_MODE — mantendo horizontal"
-            exit 0
-          fi
-
-          if ffmpeg -hide_banner -loglevel warning \
-            -i "$WORK_DIR/clip.mp4" \
-            -filter_complex "$FILTER" \
-            -c:v libx264 -preset ultrafast -crf 23 -pix_fmt yuv420p \
-            -c:a copy \
-            -movflags +faststart \
-            -y "$WORK_DIR/clip_vertical.mp4"; then
-            mv "$WORK_DIR/clip_vertical.mp4" "$WORK_DIR/clip.mp4"
-            echo "✓ Verticalizado: $(du -sh "$WORK_DIR/clip.mp4" | cut -f1)"
-          else
-            echo "⚠ Falha ao verticalizar — publicando horizontal mesmo (Facebook faz letterbox sozinho, degrada mas não quebra)"
-          fi
-
-      - name: Publicar Reel no Facebook
-        if: inputs.destination == 'reel'
-        env:
-          CAPTION: ${{ inputs.caption }}
-        run: |
-          set -e
-          # Fluxo de 2 passos da Reels Publishing API (graph.facebook.com):
-          #   1) upload_phase=start        → devolve video_id
-          #   2) upload do binário local    → sem hospedar em lugar nenhum
-          #   3) upload_phase=finish        → publica
-          # NOTA: os headers exatos do passo 2 (upload binário local) vêm
-          # da documentação/Postman collection oficial da Reels API —
-          # antes de ligar o cron em produção, valide esse passo com 1
-          # post manual e confira a resposta de /{video_id}?fields=status.
-
-          echo "→ Passo 1/3: iniciando sessão de upload..."
-          START_RESP=$(curl -s -X POST \
-            "https://graph.facebook.com/v21.0/${FB_PAGE_ID}/video_reels" \
-            -F "access_token=${FB_PAGE_TOKEN}" \
-            -F "upload_phase=start")
-          echo "  resposta: $START_RESP"
-          VIDEO_ID=$(echo "$START_RESP" | python3 -c "import sys,json; print(json.load(sys.stdin)['video_id'])")
-          echo "✓ video_id: $VIDEO_ID"
-
-          echo "→ Passo 2/3: enviando binário do clipe..."
-          FILE_SIZE=$(stat -c%s "$WORK_DIR/clip.mp4")
-          curl -s -X POST \
-            "https://graph-video.facebook.com/v21.0/${VIDEO_ID}" \
-            -H "Authorization: Bearer ${FB_PAGE_TOKEN}" \
-            -H "file_size: ${FILE_SIZE}" \
-            -H "offset: 0" \
-            --data-binary "@${WORK_DIR}/clip.mp4" \
-            -o "$WORK_DIR/upload_resp.json"
-          echo "  resposta: $(cat "$WORK_DIR/upload_resp.json")"
-
-          echo "→ Passo 3/3: publicando..."
-          FINISH_RESP=$(curl -s -X POST \
-            "https://graph.facebook.com/v21.0/${FB_PAGE_ID}/video_reels" \
-            --data-urlencode "access_token=${FB_PAGE_TOKEN}" \
-            --data-urlencode "video_id=${VIDEO_ID}" \
-            --data-urlencode "upload_phase=finish" \
-            --data-urlencode "video_state=PUBLISHED" \
-            --data-urlencode "description=${CAPTION}")
-          echo "  resposta: $FINISH_RESP"
-
-          if echo "$FINISH_RESP" | grep -q '"success":true\|"success": true'; then
-            echo "✓ Reel publicado (video_id=$VIDEO_ID)"
-          else
-            echo "✗ Publicação pode ter falhado — confira a resposta acima"
-            exit 1
-          fi
-
-      - name: Publicar vídeo normal no Facebook
-        if: inputs.destination == 'video'
-        env:
-          CAPTION: ${{ inputs.caption }}
-        run: |
-          set -e
-          echo "→ Publicando vídeo normal (não-reel)..."
-          RESP=$(curl -s -X POST \
-            "https://graph-video.facebook.com/v21.0/${FB_PAGE_ID}/videos" \
-            -F "access_token=${FB_PAGE_TOKEN}" \
-            -F "description=${CAPTION}" \
-            -F "source=@${WORK_DIR}/clip.mp4")
-          echo "  resposta: $RESP"
-          if echo "$RESP" | grep -q '"id"'; then
-            echo "✓ Vídeo publicado"
-          else
-            echo "✗ Publicação pode ter falhado — confira a resposta acima"
-            exit 1
-          fi
+      - name: Subir artefacto (pronto pra você baixar e postar manualmente)
+        uses: actions/upload-artifact@v4
+        with:
+          name: reel-${{ inputs.job_id }}
+          path: /tmp/reels_work/${{ inputs.job_id }}/output.mp4
+          retention-days: 7
 
       - name: Cleanup
         if: always()
